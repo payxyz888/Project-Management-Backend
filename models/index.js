@@ -32,7 +32,7 @@ const User = require('./User')(sequelize);
 const Project = require('./Project')(sequelize);
 const ProjectMember = require('./ProjectMember')(sequelize);
 const Task = require('./Task')(sequelize);
-const ProjectStatus = require('./ProjectStatus')(sequelize, DataTypes);
+const ProjectStatus = require('./ProjectStatus')(sequelize);
 
 // Define associations
 // User associations
