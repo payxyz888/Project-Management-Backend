@@ -12,6 +12,7 @@ const {
   Project, 
   ProjectMember, 
   Task, 
+  ProjectStatus, 
   testConnection, 
   syncDatabase 
 } = require('./models');
@@ -147,53 +148,63 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 // Project Routes
-app.get('/api/projects', authenticateToken, async (req, res) => {
+app.post('/api/projects', async (req, res) => {
+  const transaction = await sequelize.transaction();
+  
   try {
-    let projects;
-
-    if (req.user.role === 'admin') {
-      // Admin can see all projects
-      projects = await Project.findAll({
-        include: [
-          {
-            model: User,
-            as: 'creator',
-            attributes: ['id', 'username', 'email']
-          },
-          {
-            model: User,
-            as: 'members',
-            attributes: ['id', 'username', 'email'],
-            through: { attributes: ['role', 'joined_at'] }
-          }
-        ],
-        order: [['created_at', 'DESC']]
-      });
-    } else {
-      // Regular users see only their projects
-      projects = await Project.findAll({
-        include: [
-          {
-            model: User,
-            as: 'creator',
-            attributes: ['id', 'username', 'email']
-          },
-          {
-            model: User,
-            as: 'members',
-            attributes: ['id', 'username', 'email'],
-            through: { attributes: ['role', 'joined_at'] },
-            where: { id: req.user.id }
-          }
-        ],
-        order: [['created_at', 'DESC']]
+    const { name, description } = req.body;
+    
+    // Create project
+    const project = await Project.create({
+      name,
+      description,
+      created_by: req.user?.id || 1 // Use actual user ID from auth
+    }, { transaction });
+    
+    // Create project member
+    await ProjectMember.create({
+      project_id: project.id,
+      user_id: req.user?.id || 1,
+      role: 'owner'
+    }, { transaction });
+    
+    // The trigger will automatically create default statuses,
+    // but we can also manually ensure they exist:
+    const defaultStatuses = [
+      { status_key: 'todo', title: 'To Do', color: '#ef4444', order_index: 0 },
+      { status_key: 'in-progress', title: 'In Progress', color: '#f97316', order_index: 1 },
+      { status_key: 'completed', title: 'Completed', color: '#22c55e', order_index: 2 }
+    ];
+    
+    for (const statusData of defaultStatuses) {
+      await ProjectStatus.findOrCreate({
+        where: {
+          project_id: project.id,
+          status_key: statusData.status_key
+        },
+        defaults: {
+          ...statusData,
+          project_id: project.id,
+          is_default: true
+        },
+        transaction
       });
     }
-
-    res.json(projects);
+    
+    await transaction.commit();
+    
+    const createdProject = await Project.findByPk(project.id, {
+      include: [
+        { model: User, as: 'creator', attributes: ['id', 'username', 'email'] },
+        { model: ProjectStatus, as: 'statuses', where: { is_active: true } }
+      ]
+    });
+    
+    res.status(201).json(createdProject);
   } catch (error) {
-    console.error('Error fetching projects:', error);
-    res.status(500).json({ error: 'Failed to fetch projects' });
+    await transaction.rollback();
+    console.error('Error creating project:', error);
+    res.status(400).json({ message: error.message });
   }
 });
 
@@ -571,6 +582,55 @@ app.get('/api/tasks/my-tasks', authenticateToken, async (req, res) => {
   }
 });
 
+app.post('/api/tasks', async (req, res) => {
+  try {
+    const { title, description, priority, project_id, assigned_to, due_date } = req.body;
+    
+    // Get the default "todo" status for this project
+    const defaultStatus = await ProjectStatus.findOne({
+      where: {
+        project_id,
+        status_key: 'todo',
+        is_active: true
+      }
+    });
+    
+    // Get the highest position in the default status
+    const lastTask = await Task.findOne({
+      where: { status_id: defaultStatus?.id },
+      order: [['position', 'DESC']]
+    });
+    
+    const newPosition = lastTask ? lastTask.position + 1 : 0;
+    
+    const task = await Task.create({
+      title,
+      description,
+      status: 'todo',
+      status_id: defaultStatus?.id,
+      position: newPosition,
+      priority,
+      project_id,
+      assigned_to,
+      created_by: req.user?.id || 1, // Use actual user ID from auth
+      due_date
+    });
+    
+    const createdTask = await Task.findByPk(task.id, {
+      include: [
+        { model: User, as: 'assignee', attributes: ['id', 'username', 'email'] },
+        { model: User, as: 'creator', attributes: ['id', 'username', 'email'] },
+        { model: ProjectStatus, as: 'projectStatus' }
+      ]
+    });
+    
+    res.status(201).json(createdTask);
+  } catch (error) {
+    console.error('Error creating task:', error);
+    res.status(400).json({ message: error.message });
+  }
+});
+
 // Users Route (for task assignment)
 app.get('/api/users', authenticateToken, async (req, res) => {
   try {
@@ -789,6 +849,322 @@ app.get('/api/analytics/project/:id', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Error fetching project analytics:', error);
     res.status(500).json({ error: 'Failed to fetch project analytics' });
+  }
+});
+
+app.put('/api/tasks/:id/status', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status_id, position } = req.body;
+    
+    const task = await Task.findByPk(id);
+    
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+    
+    const oldStatusId = task.status_id;
+    const oldPosition = task.position;
+    
+    // Verify the new status exists and belongs to the same project
+    const newStatus = await ProjectStatus.findOne({
+      where: { 
+        id: status_id, 
+        project_id: task.project_id,
+        is_active: true 
+      }
+    });
+    
+    if (!newStatus) {
+      return res.status(400).json({ message: 'Invalid status' });
+    }
+    
+    // Handle position updates
+    if (oldStatusId === status_id) {
+      // Moving within the same status
+      if (oldPosition < position) {
+        // Moving down: shift up tasks between old and new position
+        await Task.update(
+          { position: sequelize.literal('position - 1') },
+          { 
+            where: { 
+              status_id, 
+              position: { [Op.gt]: oldPosition, [Op.lte]: position } 
+            } 
+          }
+        );
+      } else if (oldPosition > position) {
+        // Moving up: shift down tasks between new and old position
+        await Task.update(
+          { position: sequelize.literal('position + 1') },
+          { 
+            where: { 
+              status_id, 
+              position: { [Op.gte]: position, [Op.lt]: oldPosition } 
+            } 
+          }
+        );
+      }
+    } else {
+      // Moving to different status
+      
+      // Adjust positions in old status (shift up tasks after old position)
+      await Task.update(
+        { position: sequelize.literal('position - 1') },
+        { 
+          where: { 
+            status_id: oldStatusId, 
+            position: { [Op.gt]: oldPosition } 
+          } 
+        }
+      );
+      
+      // Adjust positions in new status (shift down tasks at and after new position)
+      await Task.update(
+        { position: sequelize.literal('position + 1') },
+        { 
+          where: { 
+            status_id: status_id, 
+            position: { [Op.gte]: position } 
+          } 
+        }
+      );
+      
+      // Update the task's status enum field as well
+      const statusMapping = {
+        'todo': 'todo',
+        'in-progress': 'in-progress', 
+        'completed': 'completed'
+      };
+      
+      const enumStatus = statusMapping[newStatus.status_key] || 'todo';
+      
+      await task.update({ 
+        status_id, 
+        position, 
+        status: enumStatus 
+      });
+    }
+    
+    // Update task position if moving within same status
+    if (oldStatusId === status_id) {
+      await task.update({ position });
+    }
+    
+    // Return updated task with relationships
+    const updatedTask = await Task.findByPk(task.id, {
+      include: [
+        {
+          model: ProjectStatus,
+          as: 'projectStatus'
+        },
+        {
+          model: User,
+          as: 'assignee',
+          attributes: ['id', 'username', 'email']
+        },
+        {
+          model: User,
+          as: 'creator',
+          attributes: ['id', 'username', 'email']
+        }
+      ]
+    });
+    
+    res.json(updatedTask);
+  } catch (error) {
+    console.error('Error updating task status:', error);
+    res.status(400).json({ message: error.message });
+  }
+});
+
+app.get('/api/statuses/project/:projectId', async (req, res) => {
+  try {
+    const { projectId } = req.params;
+    
+    const statuses = await ProjectStatus.findAll({
+      where: { 
+        project_id: projectId,
+        is_active: true 
+      },
+      order: [['order_index', 'ASC']],
+      include: [{
+        model: Task,
+        as: 'tasks',
+        where: { project_id: projectId },
+        required: false,
+        order: [['position', 'ASC']],
+        include: [{
+          model: User,
+          as: 'assignee',
+          attributes: ['id', 'username', 'email']
+        }]
+      }]
+    });
+    
+    res.json(statuses);
+  } catch (error) {
+    console.error('Error fetching project statuses:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+app.get('/api/statuses/kanban/:projectId', async (req, res) => {
+  try {
+    const { projectId } = req.params;
+    
+    const statuses = await ProjectStatus.findAll({
+      where: { 
+        project_id: projectId,
+        is_active: true 
+      },
+      order: [['order_index', 'ASC']],
+      include: [{
+        model: Task,
+        as: 'tasks',
+        where: { project_id: projectId },
+        required: false,
+        order: [['position', 'ASC']],
+        include: [{
+          model: User,
+          as: 'assignee',
+          attributes: ['id', 'username', 'email']
+        }, {
+          model: User,
+          as: 'creator',
+          attributes: ['id', 'username', 'email']
+        }]
+      }]
+    });
+    
+    res.json(statuses);
+  } catch (error) {
+    console.error('Error fetching kanban data:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+app.post('/api/statuses', async (req, res) => {
+  try {
+    const { title, color, project_id, status_key } = req.body;
+    
+    // Validate required fields
+    if (!title || !project_id) {
+      return res.status(400).json({ message: 'Title and project_id are required' });
+    }
+    
+    // Get the highest order_index for this project
+    const lastStatus = await ProjectStatus.findOne({
+      where: { project_id },
+      order: [['order_index', 'DESC']]
+    });
+    
+    const newOrderIndex = lastStatus ? lastStatus.order_index + 1 : 0;
+    
+    // Generate status_key if not provided
+    const generatedKey = status_key || title.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+    
+    const status = await ProjectStatus.create({
+      project_id,
+      status_key: generatedKey,
+      title,
+      color: color || '#6b7280',
+      order_index: newOrderIndex,
+      is_default: false
+    });
+    
+    res.status(201).json(status);
+  } catch (error) {
+    console.error('Error creating status:', error);
+    res.status(400).json({ message: error.message });
+  }
+});
+
+app.put('/api/statuses/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { title, color } = req.body;
+    
+    const status = await ProjectStatus.findByPk(id);
+    
+    if (!status) {
+      return res.status(404).json({ message: 'Status not found' });
+    }
+    
+    await status.update({ 
+      title: title || status.title, 
+      color: color || status.color 
+    });
+    
+    res.json(status);
+  } catch (error) {
+    console.error('Error updating status:', error);
+    res.status(400).json({ message: error.message });
+  }
+});
+
+app.put('/api/statuses/reorder/:projectId', async (req, res) => {
+  try {
+    const { projectId } = req.params;
+    const { statusIds } = req.body;
+    
+    if (!Array.isArray(statusIds)) {
+      return res.status(400).json({ message: 'statusIds must be an array' });
+    }
+    
+    // Update order_index for each status
+    const updatePromises = statusIds.map((statusId, index) => 
+      ProjectStatus.update(
+        { order_index: index }, 
+        { where: { id: statusId, project_id: projectId } }
+      )
+    );
+    
+    await Promise.all(updatePromises);
+    
+    const updatedStatuses = await ProjectStatus.findAll({
+      where: { project_id: projectId, is_active: true },
+      order: [['order_index', 'ASC']]
+    });
+    
+    res.json(updatedStatuses);
+  } catch (error) {
+    console.error('Error reordering statuses:', error);
+    res.status(400).json({ message: error.message });
+  }
+});
+
+app.delete('/api/statuses/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const status = await ProjectStatus.findByPk(id);
+    
+    if (!status) {
+      return res.status(404).json({ message: 'Status not found' });
+    }
+    
+    // Check if status has tasks
+    const taskCount = await Task.count({ where: { status_id: status.id } });
+    
+    if (taskCount > 0) {
+      return res.status(400).json({ 
+        message: 'Cannot delete status with existing tasks. Please move tasks first.' 
+      });
+    }
+    
+    // Don't allow deletion of default statuses
+    if (status.is_default) {
+      return res.status(400).json({ 
+        message: 'Cannot delete default status.' 
+      });
+    }
+    
+    await status.update({ is_active: false });
+    res.json({ message: 'Status deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting status:', error);
+    res.status(500).json({ message: error.message });
   }
 });
 

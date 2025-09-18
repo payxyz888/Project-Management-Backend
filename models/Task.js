@@ -20,10 +20,17 @@ module.exports = (sequelize) => {
       type: DataTypes.TEXT,
       allowNull: true
     },
-    status: {
-      type: DataTypes.ENUM('todo', 'in-progress', 'completed'),
-      defaultValue: 'todo',
-      allowNull: false
+    status_id: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+      references: {
+        model: 'project_statuses',
+        key: 'id'
+      }
+    },
+    position: {
+      type: DataTypes.INTEGER,
+      defaultValue: 0
     },
     priority: {
       type: DataTypes.ENUM('low', 'medium', 'high'),

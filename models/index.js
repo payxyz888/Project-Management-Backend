@@ -32,6 +32,7 @@ const User = require('./User')(sequelize);
 const Project = require('./Project')(sequelize);
 const ProjectMember = require('./ProjectMember')(sequelize);
 const Task = require('./Task')(sequelize);
+const ProjectStatus = require('./ProjectStatus')(sequelize, DataTypes);
 
 // Define associations
 // User associations
@@ -85,6 +86,11 @@ Project.hasMany(ProjectMember, {
   onDelete: 'CASCADE'
 });
 
+Project.hasMany(ProjectStatus, { 
+  foreignKey: 'project_id', 
+  as: 'statuses' 
+});
+
 // Task associations
 Task.belongsTo(Project, { 
   foreignKey: 'projectId', 
@@ -101,6 +107,11 @@ Task.belongsTo(User, {
   as: 'creator'
 });
 
+Task.belongsTo(ProjectStatus, { 
+  foreignKey: 'status_id', 
+  as: 'projectStatus' 
+});
+
 // ProjectMember associations
 ProjectMember.belongsTo(Project, { 
   foreignKey: 'projectId', 
@@ -110,6 +121,18 @@ ProjectMember.belongsTo(Project, {
 ProjectMember.belongsTo(User, { 
   foreignKey: 'userId', 
   as: 'user'
+});
+
+
+// NEW: ProjectStatus associations
+ProjectStatus.belongsTo(Project, { 
+  foreignKey: 'project_id', 
+  as: 'project' 
+});
+
+ProjectStatus.hasMany(Task, { 
+  foreignKey: 'status_id', 
+  as: 'tasks' 
 });
 
 // Test connection
@@ -138,6 +161,7 @@ module.exports = {
   Project,
   ProjectMember,
   Task,
+  ProjectStatus,
   testConnection,
-  syncDatabase
+  syncDatabase,
 };
